@@ -21,6 +21,7 @@ from tqdm import tqdm, trange
 
 # ---------------- GPT CONFIG ----------------
 
+
 @dataclass
 class GPT2Config:
     block_size: int = 1024
@@ -138,13 +139,16 @@ class GPT2:
             # apply residual scaling
             if hasattr(param, "RESIDUAL_SCALE"):
                 std *= (2 * self.config.n_layer) ** -0.5
-            param.weight = Tensor.normal(param.weight.shape, mean=0, std=std)
-            if isinstance(param, Linear) and param.bias is not None:
-                param.bias = Tensor.zeros_like(param.bias)
+            param.weight = Tensor.normal(
+                param.weight.shape, mean=0, std=std, dtype=dtypes.bfloat16
+            )
+            if param.bias is not None:
+                param.bias = Tensor.zeros_like(param.bias, dtype=dtypes.bfloat16)
         elif isinstance(param, Embedding):
             param.weight = Tensor.normal(param.weight.shape, mean=0, std=0.02)
 
     def __call__(self, idx, targets=None):
+        print(self.h[0].attn.c_attn.weight.dtype)
         B, T = idx.shape
 
         assert (
@@ -236,8 +240,11 @@ Tensor.no_grad = False
 model = GPT2(GPT2Small)
 optim = AdamW(get_parameters(model), lr=3e-4)
 dl = DataLoaderLite(4, 32, "datasets/shake.txt")
+num_epochs = 10
 losses = []
-for i in range(100):
+avg_dt = 0
+avg_tokens_per_sec = 0
+for i in range(num_epochs):
     t0 = time.perf_counter()
     x, y = dl.next_batch()
     optim.zero_grad()
@@ -246,6 +253,13 @@ for i in range(100):
     loss.backward()
     optim.step()
     t1 = time.perf_counter()
-    dt = (t1 - t0)*1000
-    tokens_per_sec = (dl.B * dl.T)/(t1-t0)
-    print(f"step {i}, loss {loss.numpy()} dt: {dt:.2f}ms tokens/sec: {tokens_per_sec:.2f}")
+    dt = (t1 - t0) * 1000
+    tokens_per_sec = (dl.B * dl.T) / (t1 - t0)
+    avg_dt += dt
+    avg_tokens_per_sec += tokens_per_sec
+    print(
+        f"step {i}, loss {loss.numpy()} dt: {dt:.2f}ms tokens/sec: {tokens_per_sec:.2f}"
+    )
+print(
+    f"avg dt: {avg_dt/num_epochs:.2f}ms avg tokens/sec: {avg_tokens_per_sec/num_epochs:.2f}"
+)
