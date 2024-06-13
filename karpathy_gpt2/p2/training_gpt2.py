@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import matplotlib.pyplot as plt
 import numpy as np
 import tiktoken
-from tinygrad import Tensor, dtypes
+from tinygrad import Tensor, dtypes, TinyJit
 from tinygrad.helpers import fetch
 from tinygrad.nn import Embedding, LayerNorm, Linear
 from tinygrad.nn.optim import AdamW
@@ -17,7 +17,25 @@ from tinygrad.nn.state import (
 )
 from tqdm import tqdm, trange
 
-# TODO: TF32
+# TODO: TF32?
+# TODO: DDP
+# TODO: Debug mixed-precision
+# TODO: Add mixed-precision for attention
+# TODO: Clip grad norm to 1 while accounting for multiple devices
+# TODO: Cosine scheduler with linear warmup
+# TODO: Is the current way I handle grad accum with TinyJit not applying to optim step slower?
+# TODO: FusedAdamW?
+
+
+# ---------------- UTILS ----------------
+
+# for now, mixed precision toggle
+MP = False
+
+mp_layer = (
+    lambda x, layer: layer(x.cast(dtypes.bfloat16)).cast(x.dtype) if MP else layer(x)
+)
+
 
 # ---------------- GPT CONFIG ----------------
 
@@ -74,9 +92,15 @@ class MLP:
         self.c_proj = Linear(config.n_embd * 4, config.n_embd)
         self.c_proj.RESIDUAL_SCALING = 1
 
+    @property
+    def parameters(self):
+        return [self.c_fc, self.c_proj]
+
     def __call__(self, x):
-        x = self.c_fc(x).gelu()
-        x = self.c_proj(x)
+        dtype = x.dtype
+        x = mp_layer(x, self.c_fc)
+        x = x.gelu()
+        x = mp_layer(x, self.c_proj)
         return x
 
 
@@ -87,10 +111,15 @@ class Attention:
         self.c_proj = Linear(config.n_embd, config.n_embd)
         self.c_proj.RESIDUAL_SCALING = 1
 
+    @property
+    def parameters(self):
+        return [self.c_attn, self.c_proj]
+
     def __call__(self, x):
         B, T, C = x.shape
+        dtype = x.dtype
 
-        q, k, v = self.c_attn(x).split(C, dim=-1)  # (B,T,3C) -> (B,T,C) x 3
+        q, k, v = mp_layer(x, self.c_attn).split(C, dim=-1)  # (B,T,3C) -> (B,T,C) x 3
         split_heads = lambda x: x.view(
             B, T, self.config.n_head, self.config.n_embd // self.config.n_head
         ).transpose(1, 2)
@@ -98,7 +127,7 @@ class Attention:
 
         y = q.scaled_dot_product_attention(k, v, is_causal=True)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
-        y = self.c_proj(y)
+        y = mp_layer(y, self.c_proj)
 
         return y
 
@@ -109,6 +138,10 @@ class TransformerBlock:
         self.ln_2 = LayerNorm(config.n_embd, eps=config.norm_eps)
         self.attn = Attention(config)
         self.mlp = MLP(config)
+
+    @property
+    def parameters(self):
+        return [self.ln_1, self.ln_2, *self.attn.parameters, *self.mlp.parameters]
 
     def __call__(self, x):
         x = x + self.attn(self.ln_1(x))
@@ -130,8 +163,15 @@ class GPT2:
         self.lm_head.weight = self.wte.weight
 
         # init weights
-        for param in get_parameters(self):
+        for param in self.parameters:
             self.init_weights(param)
+
+    @property
+    def parameters(self):
+        parameters = [self.wte, self.wpe, self.ln_f, self.lm_head]
+        for block in self.h:
+            parameters.extend(block.parameters)
+        return parameters
 
     def init_weights(self, param):
         if isinstance(param, Linear):
@@ -140,15 +180,19 @@ class GPT2:
             if hasattr(param, "RESIDUAL_SCALE"):
                 std *= (2 * self.config.n_layer) ** -0.5
             param.weight = Tensor.normal(
-                param.weight.shape, mean=0, std=std, dtype=dtypes.bfloat16
+                param.weight.shape,
+                mean=0,
+                std=std,
+                dtype=(dtypes.bfloat16 if MP else dtypes.float32),
             )
             if param.bias is not None:
-                param.bias = Tensor.zeros_like(param.bias, dtype=dtypes.bfloat16)
+                param.bias = Tensor.zeros_like(
+                    param.bias, dtype=(dtypes.bfloat16 if MP else dtypes.float32)
+                )
         elif isinstance(param, Embedding):
             param.weight = Tensor.normal(param.weight.shape, mean=0, std=0.02)
 
     def __call__(self, idx, targets=None):
-        print(self.h[0].attn.c_attn.weight.dtype)
         B, T = idx.shape
 
         assert (
@@ -159,10 +203,11 @@ class GPT2:
         tok_emb = self.wte(idx)  # (B,T) -> (B,T,C)
 
         x = tok_emb + pos_emb
+        dtype = x.dtype
         x = x.sequential(self.h)
 
         x = self.ln_f(x)
-        logits = self.lm_head(x)  # (B,T,C) -> (B,T,V)
+        logits = mp_layer(x, self.lm_head)  # (B,T,C) -> (B,T,V)
 
         if targets is not None:
             loss = logits.flatten(0, 1).sparse_categorical_crossentropy(
@@ -235,30 +280,57 @@ class DataLoaderLite:
 
 # ---------------- TRAINING ----------------
 
-Tensor.training = True
-Tensor.no_grad = False
-model = GPT2(GPT2Small)
-optim = AdamW(get_parameters(model), lr=3e-4)
-dl = DataLoaderLite(4, 32, "datasets/shake.txt")
+B = 2
+T = 1024
+
+# grad accum
+total_batch_size = 2**19  # ~.5M, measured in tokens
+assert total_batch_size % (B * T) == 0, "total batch size must be divisible by B*T"
+grad_accum_steps = total_batch_size // (B * T)
+print(f"grad_accum_steps = {grad_accum_steps}")
+
 num_epochs = 10
-losses = []
-avg_dt = 0
-avg_tokens_per_sec = 0
-for i in range(num_epochs):
-    t0 = time.perf_counter()
+
+dl = DataLoaderLite(B, T, "datasets/shake.txt")
+model = GPT2(GPT2Small)
+optim = AdamW(get_parameters(model), lr=3e-4, b1=0.9, b2=0.95, eps=1e-8)
+
+
+@TinyJit
+def train_step():
     x, y = dl.next_batch()
     optim.zero_grad()
     logits, loss = model(x, y)
-    losses.append(loss.numpy())
+    loss = (
+        loss / grad_accum_steps
+    )  # TODO: is it bad style to reference grad_accum_steps here?
     loss.backward()
+    return loss.numpy()
+
+
+Tensor.training = True
+Tensor.no_grad = False
+
+avg_dt = 0
+avg_tokens_per_sec = 0
+losses = []
+for i in range(num_epochs):
+    t0 = time.perf_counter()
+    full_batch_loss = 0
+    for micro_step in range(grad_accum_steps):
+        loss = train_step()
+        full_batch_loss += loss
+    # clip grads here
     optim.step()
+    loss = train_step(grad_accum_steps)
+    losses.append(loss)
     t1 = time.perf_counter()
     dt = (t1 - t0) * 1000
-    tokens_per_sec = (dl.B * dl.T) / (t1 - t0)
+    tokens_per_sec = (dl.B * dl.T * grad_accum_steps) / (t1 - t0)
     avg_dt += dt
     avg_tokens_per_sec += tokens_per_sec
     print(
-        f"step {i}, loss {loss.numpy()} dt: {dt:.2f}ms tokens/sec: {tokens_per_sec:.2f}"
+        f"step {i}, loss {full_batch_loss} dt: {dt:.2f}ms tokens/sec: {tokens_per_sec:.2f}"
     )
 print(
     f"avg dt: {avg_dt/num_epochs:.2f}ms avg tokens/sec: {avg_tokens_per_sec/num_epochs:.2f}"
