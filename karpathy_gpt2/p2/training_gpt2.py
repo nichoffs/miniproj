@@ -8,7 +8,7 @@ import tiktoken
 from tinygrad import Tensor, dtypes, TinyJit
 from tinygrad.helpers import fetch
 from tinygrad.nn import Embedding, LayerNorm, Linear
-from tinygrad.nn.optim import AdamW
+from tinygrad.nn.optim import AdamW, OptimizerGroup
 from tinygrad.nn.state import (
     get_parameters,
     get_state_dict,
@@ -23,19 +23,19 @@ from tqdm import tqdm, trange
 # TODO: Add mixed-precision for attention
 # TODO: Clip grad norm to 1 while accounting for multiple devices
 # TODO: Cosine scheduler with linear warmup
+# TODO: OptimizerGroup with weight decay only for Tensors with dim > 2
 # TODO: Is the current way I handle grad accum with TinyJit not applying to optim step slower?
 # TODO: FusedAdamW?
-
-
-# ---------------- UTILS ----------------
 
 # for now, mixed precision toggle
 MP = False
 
+# ---------------- UTILS ----------------
+
+
 mp_layer = (
     lambda x, layer: layer(x.cast(dtypes.bfloat16)).cast(x.dtype) if MP else layer(x)
 )
-
 
 # ---------------- GPT CONFIG ----------------
 
@@ -43,7 +43,7 @@ mp_layer = (
 @dataclass
 class GPT2Config:
     block_size: int = 1024
-    vocab_size: int = 50304
+    vocab_size: int = 50257
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
@@ -219,6 +219,7 @@ class GPT2:
 
     @staticmethod
     def build(MODEL_NAME):
+        model = GPT2(MODEL_CONFIGS[MODEL_NAME])
         weights = torch_load(
             fetch(f"https://huggingface.co/{MODEL_NAME}/resolve/main/pytorch_model.bin")
         )
@@ -234,7 +235,6 @@ class GPT2:
                 weights[k] = weights[k].T
 
         weights["lm_head.weight"] = weights["wte.weight"]
-        model = GPT2(MODEL_CONFIGS[MODEL_NAME])
         load_state_dict(model, weights)
 
         return model
@@ -278,28 +278,86 @@ class DataLoaderLite:
         return x, y
 
 
-# ---------------- TRAINING ----------------
+# ---------------- OPTIMIZER ----------------
+
+
+def create_optimizers(model, **optim_args):
+    # TODO: do I need to include requires_grad for the count to be correct?
+    # Think about this when adding bias
+
+    params_nodecay = [param for param in get_parameters(model) if len(param.shape) < 2]
+    params_decay = [param for param in get_parameters(model) if len(param.shape) >= 2]
+    num_params_decay = sum(param.numel() for param in params_decay)
+    num_params_nodecay = sum(param.numel() for param in params_nodecay)
+    print(
+        f"num decay params: {num_params_decay} num nodecay params: {num_params_nodecay}"
+    )
+    opt_decay = AdamW(params_decay, **optim_args)
+    opt_nodecay = AdamW(params_nodecay, **optim_args)
+
+    optim_group = OptimizerGroup(opt_decay, opt_nodecay)
+
+    return optim_group
+
+
+# ---------------- INITIALIZATION ----------------
 
 B = 2
 T = 1024
+total_batch_size = 2**12  # ~.5M, measured in tokens
+num_epochs = 10
+optim_args = {
+    "lr": 6e-4,
+    "b1": 0.9,
+    "b2": 0.95,
+    "eps": 1e-8,
+}
 
 # grad accum
-total_batch_size = 2**19  # ~.5M, measured in tokens
 assert total_batch_size % (B * T) == 0, "total batch size must be divisible by B*T"
 grad_accum_steps = total_batch_size // (B * T)
 print(f"grad_accum_steps = {grad_accum_steps}")
 
-num_epochs = 10
 
 dl = DataLoaderLite(B, T, "datasets/shake.txt")
-model = GPT2(GPT2Small)
-optim = AdamW(get_parameters(model), lr=3e-4, b1=0.9, b2=0.95, eps=1e-8)
+model = GPT2(GPT2Small(vocab_size=50304))
+optim_group = create_optimizers(model, **optim_args)
+
+
+# ---------------- LR ----------------
+
+
+max_lr = 6e-4
+min_lr = max_lr * 0.1
+warmup_steps = 715
+max_steps = (
+    19073  # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
+)
+
+
+def get_lr(it):
+    # 1) linear warmup for warmup_iters steps
+    if it < warmup_steps:
+        return max_lr * (it + 1) / warmup_steps
+    # 2) if it > lr_decay_iters, return min learning rate
+    if it > max_steps:
+        return min_lr
+    # 3) in between, use cosine decay down to min learning rate
+    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (
+        1.0 + math.cos(math.pi * decay_ratio)
+    )  # coeff starts at 1 and goes to 0
+    return Tensor(min_lr + coeff * (max_lr - min_lr), requires_grad=False)
+
+
+# ---------------- TRAINING ----------------
 
 
 @TinyJit
 def train_step():
     x, y = dl.next_batch()
-    optim.zero_grad()
+    optim_group.zero_grad()
     logits, loss = model(x, y)
     loss = (
         loss / grad_accum_steps
@@ -314,14 +372,18 @@ Tensor.no_grad = False
 avg_dt = 0
 avg_tokens_per_sec = 0
 losses = []
-for i in range(num_epochs):
+for step in range(num_epochs):
     t0 = time.perf_counter()
     full_batch_loss = 0
     for micro_step in range(grad_accum_steps):
         loss = train_step()
         full_batch_loss += loss
     # clip grads here
-    optim.step()
+    lr = get_lr(step)
+    # TODO: be careful about device with lr here?
+    for optim in optim_group.optimizers:
+        optim.lr = lr
+    optim_group.step()
     loss = train_step(grad_accum_steps)
     losses.append(loss)
     t1 = time.perf_counter()
@@ -330,7 +392,7 @@ for i in range(num_epochs):
     avg_dt += dt
     avg_tokens_per_sec += tokens_per_sec
     print(
-        f"step {i}, loss {full_batch_loss} dt: {dt:.2f}ms tokens/sec: {tokens_per_sec:.2f}"
+        f"step {step}, loss {full_batch_loss} dt: {dt:.2f}ms tokens/sec: {tokens_per_sec:.2f}"
     )
 print(
     f"avg dt: {avg_dt/num_epochs:.2f}ms avg tokens/sec: {avg_tokens_per_sec/num_epochs:.2f}"
