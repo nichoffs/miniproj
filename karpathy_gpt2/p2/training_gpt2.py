@@ -22,13 +22,11 @@ from tqdm import tqdm, trange
 # TODO: Debug mixed-precision
 # TODO: Add mixed-precision for attention
 # TODO: Clip grad norm to 1 while accounting for multiple devices
-# TODO: Cosine scheduler with linear warmup
-# TODO: OptimizerGroup with weight decay only for Tensors with dim > 2
 # TODO: Is the current way I handle grad accum with TinyJit not applying to optim step slower?
 # TODO: FusedAdamW?
 
 # for now, mixed precision toggle
-MP = False
+MP = True
 
 # ---------------- UTILS ----------------
 
@@ -303,9 +301,9 @@ def create_optimizers(model, **optim_args):
 # ---------------- INITIALIZATION ----------------
 
 B = 2
-T = 1024
+T = 32
 total_batch_size = 2**12  # ~.5M, measured in tokens
-num_epochs = 10
+num_epochs = 100
 optim_args = {
     "lr": 6e-4,
     "b1": 0.9,
@@ -392,7 +390,7 @@ for step in range(num_epochs):
     avg_dt += dt
     avg_tokens_per_sec += tokens_per_sec
     print(
-        f"step {step}, loss {full_batch_loss} dt: {dt:.2f}ms tokens/sec: {tokens_per_sec:.2f}"
+        f"step: {step} | lr: {lr:.5f} | loss {full_batch_loss} | dt: {dt:.2f}ms | tokens/sec: {tokens_per_sec:.2f}"
     )
 print(
     f"avg dt: {avg_dt/num_epochs:.2f}ms avg tokens/sec: {avg_tokens_per_sec/num_epochs:.2f}"
