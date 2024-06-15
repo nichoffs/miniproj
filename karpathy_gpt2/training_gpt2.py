@@ -1,11 +1,13 @@
 import os
+from os import getenv
+from sys import exit  # for debugging
 import time
 from dataclasses import dataclass
 
 import matplotlib.pyplot as plt
 import numpy as np
 import tiktoken
-from tinygrad import Tensor, dtypes, TinyJit
+from tinygrad import Tensor, device, dtypes, TinyJit, Device
 from tinygrad.helpers import fetch
 from tinygrad.nn import Embedding, LayerNorm, Linear
 from tinygrad.nn.optim import AdamW, OptimizerGroup
@@ -19,11 +21,10 @@ from tqdm import tqdm, trange
 
 # TODO: TF32?
 # TODO: DDP
-# TODO: Debug mixed-precision
-# TODO: Add mixed-precision for attention
+# TODO: Mixed-precision - + expand attention if necessary to do mixed precision on dot
 # TODO: Clip grad norm to 1 while accounting for multiple devices
-# TODO: Is the current way I handle grad accum with TinyJit not applying to optim step slower?
 # TODO: FusedAdamW?
+# TODO: FineWebEdu
 
 # for now, mixed precision toggle
 MP = True
@@ -31,9 +32,28 @@ MP = True
 # ---------------- UTILS ----------------
 
 
-mp_layer = (
-    lambda x, layer: layer(x.cast(dtypes.bfloat16)).cast(x.dtype) if MP else layer(x)
-)
+# taken from https://github.com/tinygrad/tinygrad/blob/97b05f567e8e42a2475f8a063fb080b200f6f033/extra/models/mask_rcnn.py
+def topk(input_, k, device, dim=-1, largest=True, sorted=False):
+    k = min(k, input_.shape[dim] - 1)
+    input_ = input_.numpy()
+    if largest:
+        input_ *= -1
+    ind = np.argpartition(input_, k, axis=dim)
+    if largest:
+        input_ *= -1
+    ind = np.take(ind, np.arange(k), axis=dim)  # k non-sorted indices
+    input_ = np.take_along_axis(input_, ind, axis=dim)  # k non-sorted values
+    if not sorted:
+        return Tensor(input_, device=device), Tensor(ind, device=device)
+    if largest:
+        input_ *= -1
+    ind_part = np.argsort(input_, axis=dim)
+    ind = np.take_along_axis(ind, ind_part, axis=dim)
+    if largest:
+        input_ *= -1
+    val = np.take_along_axis(input_, ind_part, axis=dim)
+    return Tensor(val, device=device), Tensor(ind, device=device)
+
 
 # ---------------- GPT CONFIG ----------------
 
@@ -95,10 +115,9 @@ class MLP:
         return [self.c_fc, self.c_proj]
 
     def __call__(self, x):
-        dtype = x.dtype
-        x = mp_layer(x, self.c_fc)
+        x = self.c_fc(x)
         x = x.gelu()
-        x = mp_layer(x, self.c_proj)
+        x = self.c_proj(x)
         return x
 
 
@@ -117,7 +136,7 @@ class Attention:
         B, T, C = x.shape
         dtype = x.dtype
 
-        q, k, v = mp_layer(x, self.c_attn).split(C, dim=-1)  # (B,T,3C) -> (B,T,C) x 3
+        q, k, v = self.c_attn(x).split(C, dim=-1)  # (B,T,3C) -> (B,T,C) x 3
         split_heads = lambda x: x.view(
             B, T, self.config.n_head, self.config.n_embd // self.config.n_head
         ).transpose(1, 2)
@@ -125,7 +144,7 @@ class Attention:
 
         y = q.scaled_dot_product_attention(k, v, is_causal=True)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
-        y = mp_layer(y, self.c_proj)
+        y = self.c_proj(y)
 
         return y
 
@@ -196,7 +215,7 @@ class GPT2:
         assert (
             T <= self.config.block_size
         ), f"Cannot forward, model block size is {self.config.block_size} but got sequence of length {T}"
-        pos = Tensor.arange(0, T, dtype=dtypes.long)  # (T,)
+        pos = Tensor.arange(0, T, dtype=dtypes.long, device=GPUS)  # (T,)
         pos_emb = self.wpe(pos)  # (T,) -> (T,C)
         tok_emb = self.wte(idx)  # (B,T) -> (B,T,C)
 
@@ -205,7 +224,7 @@ class GPT2:
         x = x.sequential(self.h)
 
         x = self.ln_f(x)
-        logits = mp_layer(x, self.lm_head)  # (B,T,C) -> (B,T,V)
+        logits = self.lm_head(x)  # (B,T,C) -> (B,T,V)
 
         if targets is not None:
             loss = logits.flatten(0, 1).sparse_categorical_crossentropy(
@@ -214,6 +233,29 @@ class GPT2:
             return logits, loss.realize()
 
         return logits, None
+
+    def generate(self, prompt: str, tokenizer, max_length, num_return_sequences):
+        tokens = tokenizer.encode(prompt)
+        x = (
+            Tensor(tokens, dtype=dtypes.long, device=GPUS)
+            .unsqueeze(0)
+            .repeat(num_return_sequences, 1)
+        )
+        Tensor.no_grad = True
+        Tensor.training = False
+        while x.shape[1] < max_length:
+            logits, _ = self(x)
+            logits = logits[:, -1, :]
+            probs = logits.softmax(-1)
+            topk_probs, topk_indices = topk(probs, 50, GPUS, dim=-1)
+            ix = topk_probs.multinomial(1)
+            xcol = topk_indices.gather(-1, ix)
+            x = x.cat(xcol, dim=1)
+
+        for i in range(num_return_sequences):
+            tokens = x[i, :max_length].numpy().tolist()
+            decoded = tokenizer.decode(tokens)
+            print(">", decoded)
 
     @staticmethod
     def build(MODEL_NAME):
@@ -237,6 +279,11 @@ class GPT2:
 
         return model
 
+
+# ---------------- MULTI GPU ----------------
+
+GPUS = [f"{Device.DEFAULT}:{i}" for i in range(getenv("GPUS", 1))]
+NUM_GPUS = len(GPUS)
 
 # ---------------- DATA LOADER ----------------
 
@@ -265,11 +312,11 @@ class DataLoaderLite:
         B, T = self.B, self.T
 
         buf = self.tokens[self.current_position : self.current_position + B * T + 1]
-        x = self.batch(buf[:-1])
-        y = self.batch(buf[1:])
-        self.current_position += B * T
+        x = self.batch(buf[:-1]).shard_(GPUS, axis=0)
+        y = self.batch(buf[1:]).shard_(GPUS, axis=0)
+        self.current_position += B * T * NUM_GPUS
 
-        if self.current_position + (B * T + 1) > len(self.tokens):
+        if self.current_position + (B * T * NUM_GPUS + 1) > len(self.tokens):
             print("read entire document, resetting position...")
             self.current_position = 0
 
@@ -290,8 +337,8 @@ def create_optimizers(model, **optim_args):
     print(
         f"num decay params: {num_params_decay} num nodecay params: {num_params_nodecay}"
     )
-    opt_decay = AdamW(params_decay, **optim_args)
-    opt_nodecay = AdamW(params_nodecay, **optim_args)
+    opt_decay = AdamW(params_decay, **optim_args, weight_decay=0.1)
+    opt_nodecay = AdamW(params_nodecay, **optim_args, weight_decay=0)
 
     optim_group = OptimizerGroup(opt_decay, opt_nodecay)
 
@@ -301,7 +348,7 @@ def create_optimizers(model, **optim_args):
 # ---------------- INITIALIZATION ----------------
 
 B = 2
-T = 32
+T = 1024
 total_batch_size = 2**12  # ~.5M, measured in tokens
 num_epochs = 100
 optim_args = {
@@ -317,8 +364,11 @@ grad_accum_steps = total_batch_size // (B * T)
 print(f"grad_accum_steps = {grad_accum_steps}")
 
 
+tokenizer = tiktoken.get_encoding("gpt2")
 dl = DataLoaderLite(B, T, "datasets/shake.txt")
 model = GPT2(GPT2Small(vocab_size=50304))
+for k, x in get_state_dict(model).items():
+    x.to_(GPUS)
 optim_group = create_optimizers(model, **optim_args)
 
 
@@ -364,13 +414,20 @@ def train_step():
     return loss.numpy()
 
 
-Tensor.training = True
-Tensor.no_grad = False
-
 avg_dt = 0
 avg_tokens_per_sec = 0
 losses = []
 for step in range(num_epochs):
+    last_step = step == max_steps - 1
+    if (step > 0 and step % 250 == 0) or last_step:
+        model.generate(
+            "Hello, I'm a language model,",
+            tokenizer,
+            max_length=30,
+            num_return_sequences=2,
+        )
+    Tensor.training = True
+    Tensor.no_grad = False
     t0 = time.perf_counter()
     full_batch_loss = 0
     for micro_step in range(grad_accum_steps):
